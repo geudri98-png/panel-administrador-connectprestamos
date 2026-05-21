@@ -119,6 +119,7 @@
 
             // Formularios
             const [newAccount, setNewAccount] = useState({ name: '', cedula: '', phone: '', email: '', password: '', companyName: '', days: 30, maxRoutes: 2, maxCobradores: 3 });
+            const [editEndDate, setEditEndDate] = useState('');
             const [editDays, setEditDays] = useState(0);
             const [editRoutes, setEditRoutes] = useState(2);
             const [editCobradores, setEditCobradores] = useState(3);
@@ -329,6 +330,7 @@
 
             const openManageModal = (tenant) => {
                 setSelectedTenant(tenant);
+                setEditEndDate(tenant.subscriptionEndDate || '');
                 setEditRoutes(tenant.maxRoutes || 2);
                 setEditCobradores(tenant.maxCobradores || 3);
                 setEditDays(0);
@@ -355,18 +357,40 @@
                   });
             };
 
-            const handleUpdateSubscription = async () => {
+            const resetSubscriptionToPast = async () => {
+                if (!selectedTenant) return;
                 setIsProcessing(true);
                 try {
-                    const currentEndDate = new Date(selectedTenant.subscriptionEndDate || new Date());
-                    const addedDays = parseInt(editDays) || 0;
-                    
+                    const yesterday = new Date();
+                    yesterday.setDate(yesterday.getDate() - 1);
+                    await db.collection('users').doc(selectedTenant.id).update({
+                        subscriptionEndDate: yesterday.toISOString().split('T')[0]
+                    });
+                    showNotify("Licencia reseteada a fecha pasada. El bloqueo se aplicará inmediatamente.");
+                    setSelectedTenant(null);
+                } catch (error) {
+                    showNotify("Error al resetear la licencia");
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const handleUpdateSubscription = async () => {
+                if (!selectedTenant) return;
+                setIsProcessing(true);
+                try {
                     const today = new Date();
-                    let newDate = currentEndDate;
-                    
-                    if (addedDays > 0) {
-                        if (currentEndDate < today) newDate = today;
-                        newDate.setDate(newDate.getDate() + addedDays);
+                    today.setHours(0, 0, 0, 0);
+
+                    let newDate = null;
+                    if (editEndDate) {
+                        newDate = new Date(editEndDate);
+                        if (isNaN(newDate.getTime())) throw new Error('Fecha inválida');
+                    } else if (parseInt(editDays, 10) > 0) {
+                        newDate = new Date(today);
+                        newDate.setDate(newDate.getDate() + parseInt(editDays, 10));
+                    } else {
+                        newDate = new Date(selectedTenant.subscriptionEndDate || today);
                     }
 
                     await db.collection('users').doc(selectedTenant.id).update({
@@ -379,6 +403,7 @@
                     showNotify("Licencia actualizada correctamente");
                     setSelectedTenant(null);
                 } catch (error) {
+                    console.error("Error updating subscription:", error);
                     showNotify("Error al actualizar");
                 } finally {
                     setIsProcessing(false);
@@ -803,36 +828,41 @@
                                 <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-3 ml-1 border-t border-slate-200 pt-4">Configurar Licencia</h4>
                                 <div className="space-y-4 mb-6">
                                     <div className="space-y-1.5 bg-slate-50 p-3 rounded-xl border border-slate-200">
-                                        <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest flex justify-between mb-2">
-                                            <span>Renovar / Sumar Días (Manual)</span>
-                                        </label>
-                                        <div className="flex gap-2">
-                                            <button onClick={()=>setEditDays(Math.max(0, parseInt(editDays || 0)-1))} className="w-10 bg-white border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95 shadow-sm">-</button>
-                                            <input type="number" value={editDays} onChange={e=>setEditDays(e.target.value)} className="flex-1 p-3 bg-white border border-slate-200 rounded-lg text-center font-black outline-none text-indigo-600 focus:border-indigo-500" />
-                                            <button onClick={()=>setEditDays(parseInt(editDays || 0)+1)} className="w-10 bg-white border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95 shadow-sm">+</button>
-                                        </div>
+                                        <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest mb-2">Fecha de expiración (nuevo valor)</label>
+                                        <input type="date" value={editEndDate} onChange={e => setEditEndDate(e.target.value)} className="w-full p-3 bg-white border border-slate-200 rounded-lg text-sm font-black outline-none text-slate-700 focus:border-indigo-500" />
+                                        <p className="text-[10px] text-slate-400">Ingresa una fecha para sobrescribir el fin de suscripción. Si se ingresa una fecha, se usará esa fecha exacta.</p>
                                     </div>
-                                    
+
+                                    <div className="space-y-1.5 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                                        <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest mb-2">Días totales desde hoy</label>
+                                        <div className="flex gap-2">
+                                            <button onClick={() => setEditDays(Math.max(0, parseInt(editDays || 0) - 1))} className="w-10 bg-white border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95 shadow-sm">-</button>
+                                            <input type="number" value={editDays} onChange={e => setEditDays(e.target.value)} className="flex-1 p-3 bg-white border border-slate-200 rounded-lg text-center font-black outline-none text-indigo-600 focus:border-indigo-500" />
+                                            <button onClick={() => setEditDays(parseInt(editDays || 0) + 1)} className="w-10 bg-white border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95 shadow-sm">+</button>
+                                        </div>
+                                        <p className="text-[10px] text-slate-400">Si no defines fecha, este valor establecerá el nuevo fin en hoy + días.</p>
+                                    </div>
+
                                     <div className="grid grid-cols-2 gap-3">
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest flex justify-between">
                                                 <span>Límite Rutas</span>
                                             </label>
                                             <div className="flex gap-1">
-                                                <button onClick={()=>setEditRoutes(Math.max(1, editRoutes-1))} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">-</button>
+                                                <button onClick={() => setEditRoutes(Math.max(1, editRoutes - 1))} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">-</button>
                                                 <input type="number" value={editRoutes} readOnly className="flex-1 bg-slate-50 border border-slate-200 rounded-lg text-center font-black outline-none text-purple-600 w-12" />
-                                                <button onClick={()=>setEditRoutes(editRoutes+1)} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">+</button>
+                                                <button onClick={() => setEditRoutes(editRoutes + 1)} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">+</button>
                                             </div>
                                         </div>
-                                        
+
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest flex justify-between">
                                                 <span>Lím. Cobradores</span>
                                             </label>
                                             <div className="flex gap-1">
-                                                <button onClick={()=>setEditCobradores(Math.max(0, editCobradores-1))} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">-</button>
+                                                <button onClick={() => setEditCobradores(Math.max(0, editCobradores - 1))} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">-</button>
                                                 <input type="number" value={editCobradores} readOnly className="flex-1 bg-slate-50 border border-slate-200 rounded-lg text-center font-black outline-none text-amber-600 w-12" />
-                                                <button onClick={()=>setEditCobradores(editCobradores+1)} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">+</button>
+                                                <button onClick={() => setEditCobradores(editCobradores + 1)} className="w-8 h-8 bg-slate-100 border border-slate-200 rounded-lg text-slate-600 font-black active:scale-95">+</button>
                                             </div>
                                         </div>
                                     </div>
@@ -843,10 +873,13 @@
                                         <button onClick={toggleStatus} disabled={isProcessing} className={`flex-[0.8] p-4 rounded-xl font-black text-[11px] uppercase tracking-widest transition-all border shadow-sm ${selectedTenant.planStatus === 'active' ? 'bg-orange-50 text-orange-600 border-orange-200 hover:bg-orange-100' : 'bg-emerald-50 text-emerald-600 border-emerald-200 hover:bg-emerald-100'}`}>
                                             {selectedTenant.planStatus === 'active' ? 'Suspender' : 'Reactivar'}
                                         </button>
-                                        <button onClick={handleUpdateSubscription} disabled={isProcessing || (editDays == 0 && editRoutes == (selectedTenant.maxRoutes || 2) && editCobradores == (selectedTenant.maxCobradores || 3))} className="flex-1 bg-slate-800 text-white p-4 rounded-xl font-black text-[11px] uppercase tracking-widest shadow-xl active:scale-95 disabled:opacity-50">
+                                        <button onClick={handleUpdateSubscription} disabled={isProcessing || (editEndDate === '' && parseInt(editDays, 10) <= 0 && editRoutes == (selectedTenant.maxRoutes || 2) && editCobradores == (selectedTenant.maxCobradores || 3))} className="flex-1 bg-slate-800 text-white p-4 rounded-xl font-black text-[11px] uppercase tracking-widest shadow-xl active:scale-95 disabled:opacity-50">
                                             Guardar Licencia
                                         </button>
                                     </div>
+                                    <button onClick={resetSubscriptionToPast} disabled={isProcessing} className="w-full p-3 bg-red-50 text-red-600 border border-red-200 rounded-xl hover:bg-red-100 active:scale-95 transition-all shadow-sm flex items-center justify-center gap-2 font-black text-[10px] uppercase tracking-widest">
+                                        <Icon name="trash" size={14}/> Reset/Remove (vencimiento inmediato)
+                                    </button>
                                     <button onClick={handleDeleteTenant} disabled={isProcessing} className="w-full p-3 bg-red-50 text-red-600 border border-red-200 rounded-xl hover:bg-red-100 active:scale-95 transition-all shadow-sm flex items-center justify-center gap-2 font-black text-[10px] uppercase tracking-widest mt-1" title="Eliminar Base de Datos permanentemente">
                                         <Icon name="trash" size={14}/> Eliminar Cliente Totalmente
                                     </button>
