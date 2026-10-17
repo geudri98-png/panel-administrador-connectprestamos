@@ -171,6 +171,31 @@
                                     return dateB - dateA;
                                 });
                                 setTenants(data);
+                                // Backfill: asignar identificador CLI-XXX a clientes antiguos que no lo tengan (idempotente)
+                                const missingCodes = data.filter(t => !t.clientCode);
+                                if (missingCodes.length > 0) {
+                                    (async () => {
+                                        try {
+                                            const configRef = db.collection('system').doc('admin_config');
+                                            const cfg = await configRef.get();
+                                            let counter = (cfg.exists && cfg.data().clientCounter) || 0;
+                                            data.forEach(t => {
+                                                const m = t.clientCode && /^CLI-(\d+)$/.exec(t.clientCode);
+                                                if (m) counter = Math.max(counter, parseInt(m[1], 10));
+                                            });
+                                            missingCodes.sort((a, b) => {
+                                                const da = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(0);
+                                                const dbb = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(0);
+                                                return da - dbb;
+                                            });
+                                            for (const t of missingCodes) {
+                                                counter++;
+                                                await db.collection('users').doc(t.id).update({ clientCode: 'CLI-' + String(counter).padStart(3, '0') });
+                                            }
+                                            await configRef.set({ clientCounter: counter }, { merge: true });
+                                        } catch (e) { console.error("Error asignando códigos de cliente:", e); }
+                                    })();
+                                }
                             }, error => {
                                 console.error("Error en snapshot:", error);
                                 showNotify("Error de permisos. Revisa las reglas de Firestore.");
@@ -279,8 +304,21 @@
                     const endDate = new Date();
                     endDate.setDate(endDate.getDate() + parseInt(newAccount.days));
 
+                    // Identificador único del cliente (CLI-001, CLI-002...) para no confundirlos
+                    const configRef = db.collection('system').doc('admin_config');
+                    const configSnap = await configRef.get();
+                    const existingCodes = [];
+                    const tenantsSnap = await db.collection('users').where('role', '==', 'admin').get();
+                    tenantsSnap.docs.forEach(d => {
+                        const m = d.data().clientCode && /^CLI-(\d+)$/.exec(d.data().clientCode);
+                        if (m) existingCodes.push(parseInt(m[1], 10));
+                    });
+                    const nextNum = Math.max(configSnap.exists && configSnap.data().clientCounter ? configSnap.data().clientCounter : 0, ...existingCodes, 0) + 1;
+                    const clientCode = 'CLI-' + String(nextNum).padStart(3, '0');
+
                     await db.collection('users').doc(res.user.uid).set({
                         role: 'admin',
+                        clientCode: clientCode,
                         name: newAccount.name,
                         cedula: newAccount.cedula,
                         phone: newAccount.phone,
@@ -294,6 +332,7 @@
                         historicalGains: 0,
                         createdAt: firebase.firestore.FieldValue.serverTimestamp()
                     });
+                    await configRef.set({ clientCounter: nextNum }, { merge: true });
 
                     showNotify("¡Cuenta de cliente creada con éxito!");
                     setShowCreateModal(false);
@@ -384,13 +423,17 @@
 
                     let newDate = null;
                     if (editEndDate) {
-                        newDate = new Date(editEndDate);
-                        if (isNaN(newDate.getTime())) throw new Error('Fecha inválida');
+                        // Fecha exacta elegida en el calendario (se interpreta en hora local)
+                        newDate = parseLocalDate(editEndDate);
+                        if (!newDate) throw new Error('Fecha inválida');
                     } else if (parseInt(editDays, 10) > 0) {
-                        newDate = new Date(today);
-                        newDate.setDate(newDate.getDate() + parseInt(editDays, 10));
+                        // Los días se SUMAN a la fecha de corte vigente si aún no vence; si venció, se cuenta desde hoy
+                        const currentEnd = parseLocalDate(selectedTenant.subscriptionEndDate);
+                        const base = (currentEnd && currentEnd >= today) ? new Date(currentEnd) : new Date(today);
+                        base.setDate(base.getDate() + parseInt(editDays, 10));
+                        newDate = base;
                     } else {
-                        newDate = new Date(selectedTenant.subscriptionEndDate || today);
+                        newDate = parseLocalDate(selectedTenant.subscriptionEndDate) || new Date(today);
                     }
 
                     await db.collection('users').doc(selectedTenant.id).update({
@@ -535,12 +578,33 @@
                 }
             };
 
+            // Parsea 'YYYY-MM-DD' como fecha LOCAL (evita que venza horas antes por UTC)
+            const parseLocalDate = (dateStr) => {
+                if(!dateStr) return null;
+                const parts = String(dateStr).split('-');
+                if (parts.length < 3 || parts[0].length !== 4) {
+                    const d = new Date(dateStr);
+                    return isNaN(d.getTime()) ? null : d;
+                }
+                return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+            };
+
             const isExpired = (dateStr) => {
-                if(!dateStr) return true;
-                const end = new Date(dateStr);
+                const end = parseLocalDate(dateStr);
+                if(!end) return true;
                 const today = new Date();
                 today.setHours(0,0,0,0);
                 return end < today;
+            };
+
+            // Días restantes de licencia (0 si vencida)
+            const daysLeft = (dateStr) => {
+                const end = parseLocalDate(dateStr);
+                if(!end) return 0;
+                const today = new Date();
+                today.setHours(0,0,0,0);
+                const diff = Math.ceil((end - today) / (1000 * 60 * 60 * 24));
+                return diff < 0 ? 0 : diff;
             };
 
             const formatDate = (dateObj) => {
@@ -559,7 +623,8 @@
                         t.companyName?.toLowerCase().includes(query) ||
                         t.email?.toLowerCase().includes(query) ||
                         t.cedula?.toLowerCase().includes(query) ||
-                        t.phone?.toLowerCase().includes(query);
+                        t.phone?.toLowerCase().includes(query) ||
+                        t.clientCode?.toLowerCase().includes(query);
                     
                     if (!matchesSearch && query !== '') return false;
 
@@ -739,9 +804,22 @@
                         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
                             <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-6 animate-in border border-slate-200 max-h-[90vh] overflow-y-auto no-scrollbar shadow-2xl">
                                 <div className="flex justify-between items-start mb-6">
-                                    <div className="flex-1 pr-2">
-                                        <h3 className="heading-font text-lg font-black text-slate-800 break-all leading-tight"><Icon name="mail" size={18} className="inline text-indigo-500 mr-1.5 mb-1"/>{selectedTenant.email}</h3>
-                                        <p className="text-[10px] uppercase tracking-widest text-slate-500 font-black mt-1">Empresa: {selectedTenant.companyName || selectedTenant.name}</p>
+                                    <div className="flex gap-3 items-center flex-1 pr-2 min-w-0">
+                                        {selectedTenant.logo ? (
+                                            <img src={selectedTenant.logo} alt={selectedTenant.companyName || selectedTenant.name} className="w-14 h-14 rounded-2xl object-cover border border-slate-200 shrink-0 bg-white" />
+                                        ) : (
+                                            <div className="w-14 h-14 rounded-2xl flex items-center justify-center font-black text-xl bg-indigo-50 text-indigo-600 border border-indigo-100 shrink-0">
+                                                {((selectedTenant.companyName || selectedTenant.email || 'C')[0] || 'C').toUpperCase()}
+                                            </div>
+                                        )}
+                                        <div className="min-w-0">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <h3 className="heading-font text-lg font-black text-slate-800 leading-tight break-words">{selectedTenant.companyName || selectedTenant.name || 'Sin nombre'}</h3>
+                                                {selectedTenant.clientCode && <span className="text-[9px] font-black bg-indigo-600 text-white px-2 py-0.5 rounded-md uppercase tracking-widest shrink-0">{selectedTenant.clientCode}</span>}
+                                            </div>
+                                            <p className="text-[11px] text-slate-500 font-bold mt-0.5 break-all">{selectedTenant.email}</p>
+                                            <p className="text-[10px] uppercase tracking-widest text-slate-400 font-black mt-0.5">Dueño: {selectedTenant.name || 'N/D'} • {selectedTenant.phone || 'Sin WhatsApp'} • Céd: {selectedTenant.cedula || 'N/D'}</p>
+                                        </div>
                                     </div>
                                     <button onClick={() => setSelectedTenant(null)} className="text-slate-400 bg-slate-50 p-2 rounded-full hover:text-slate-600 flex-shrink-0"><Icon name="x"/></button>
                                 </div>
@@ -988,12 +1066,20 @@
                                         {/* Cabecera Acordeón */}
                                         <div onClick={() => setExpandedClient(isExpanded ? null : t.id)} className="p-6 border-b border-slate-100 flex items-center justify-between cursor-pointer hover:bg-slate-50 transition-colors">
                                             <div className="flex gap-4 items-center min-w-0 flex-1">
-                                                <div className="w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg bg-indigo-50 text-indigo-600 border border-indigo-100 flex-shrink-0 shadow-sm">
-                                                    {t.email ? t.email[0].toUpperCase() : 'C'}
-                                                </div>
-                                                <div className="min-w-0 pr-4">
-                                                    <h4 className="font-black text-base text-slate-800 leading-tight truncate" title={t.email}>{t.email}</h4>
-                                                    <p className="text-xs font-bold text-slate-500 mt-1 uppercase tracking-widest truncate">{t.companyName || t.name}</p>
+                                                {t.logo ? (
+                                                    <img src={t.logo} alt={t.companyName || t.name} className="w-14 h-14 rounded-2xl object-cover border border-slate-200 flex-shrink-0 shadow-sm bg-white" />
+                                                ) : (
+                                                    <div className="w-14 h-14 rounded-2xl flex items-center justify-center font-black text-xl bg-indigo-50 text-indigo-600 border border-indigo-100 flex-shrink-0 shadow-sm">
+                                                        {(t.companyName || t.email || 'C')[0].toUpperCase()}
+                                                    </div>
+                                                )}
+                                                <div className="min-w-0 pr-2">
+                                                    <div className="flex items-center gap-2 flex-wrap">
+                                                        <h4 className="font-black text-lg text-slate-800 leading-tight break-words" title={t.companyName || t.name}>{t.companyName || t.name || 'Sin nombre'}</h4>
+                                                        {t.clientCode && <span className="text-[9px] font-black bg-indigo-600 text-white px-2 py-0.5 rounded-md uppercase tracking-widest shrink-0">{t.clientCode}</span>}
+                                                    </div>
+                                                    <p className="text-xs font-bold text-slate-500 mt-1 truncate" title={t.email}>{t.email}</p>
+                                                    <p className="text-[10px] font-bold text-slate-400 mt-0.5 uppercase tracking-widest truncate">Dueño: {t.name || 'N/D'}</p>
                                                 </div>
                                             </div>
 
@@ -1015,6 +1101,9 @@
                                                     <div>
                                                         <p className="text-[9px] font-black uppercase text-slate-400 tracking-widest mb-1 flex items-center gap-1"><Icon name="calendar" size={10}/> Vencimiento</p>
                                                         <p className={`text-sm font-black ${expired && !isSuspended ? 'text-orange-600' : 'text-slate-700'}`}>{t.subscriptionEndDate || 'N/D'}</p>
+                                                        {!expired && !isSuspended && t.subscriptionEndDate && (
+                                                            <p className="text-[10px] font-black text-emerald-600 mt-0.5">{daysLeft(t.subscriptionEndDate)} {daysLeft(t.subscriptionEndDate) === 1 ? 'día restante' : 'días restantes'}</p>
+                                                        )}
                                                     </div>
                                                     <div>
                                                         <p className="text-[9px] font-black uppercase text-slate-400 tracking-widest mb-1 flex items-center gap-1"><Icon name="calendar" size={10}/> Registrado</p>
